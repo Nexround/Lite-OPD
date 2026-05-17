@@ -97,7 +97,6 @@ src/opd/
 - Python 3.10+
 - PyTorch 2.4+
 - CUDA 12.1+
-- GPU: 1 张及以上（推荐 H100/A100 80GB）
 
 ### 安装
 
