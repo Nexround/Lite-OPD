@@ -98,7 +98,6 @@ See [docs/acceleration_techniques.md](docs/acceleration_techniques.md) for detai
 - Python 3.10+
 - PyTorch 2.4+
 - CUDA 12.1+
-- GPU: 1 or more (H100/A100 80GB recommended)
 
 ### Installation
 
