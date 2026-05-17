@@ -1,0 +1,32 @@
+loss: reverse_kl
+student_model: /path/to/Qwen3-1.7B
+teacher_model: /path/to/Qwen3-8B
+train_dataset: datasets/train/math_metamath_openr1_1to1_1280.parquet
+eval_dataset: datasets/eval/omni_math_4_5_200.jsonl
+output_dir: results/example_qwen3
+
+distributed_strategy: zero2
+kl_backward_mode: two_stage
+max_pack_tokens: 16384
+
+learning_rate: 5e-6
+global_batch_size: 16
+
+generation_mem_fraction_static: 0.9
+generation_max_running_req: 64
+generation_page_size: 16
+generation_attention_backend: fi
+generation_admission_reserve_tokens: 2048
+generation_max_preemptions_per_req: 3
+
+enable_gradient_checkpointing: true
+temperature: 0.6
+top_p: 0.9
+generation_top_k: 20
+max_total_tokens: 4096
+eval_every_steps: 10
+log_every: 1
+max_steps: 20
+num_epochs: 1
+save_every_steps: 50
+skip_eval: false

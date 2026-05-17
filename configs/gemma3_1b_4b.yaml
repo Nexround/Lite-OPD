@@ -1,0 +1,31 @@
+loss: reverse_kl
+student_model: /path/to/gemma-3-1b-it
+teacher_model: /path/to/gemma-3-4b-it
+train_dataset: /path/to/math_metamath_openr1_1to1
+eval_dataset: /path/to/math_hf/test_all.jsonl
+output_dir: results/gemma3_1b_4b
+
+max_pack_tokens: 65536
+
+learning_rate: 5e-6
+global_batch_size: 128
+
+generation_mem_fraction_static: 0.9
+generation_max_running_req: 200
+generation_page_size: 16
+generation_attention_backend: fi
+generation_admission_reserve_tokens: 2048
+generation_max_preemptions_per_req: 3
+
+enable_gradient_checkpointing: true
+temperature: 0
+max_total_tokens: 16384
+train_subset_size: 100000
+eval_subset_size: 200
+validation_subset_size: 200
+eval_every_steps: 50
+log_every: 1
+max_steps: 500
+num_epochs: 1
+save_every_steps: 100
+skip_eval: false
