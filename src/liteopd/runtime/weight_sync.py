@@ -21,10 +21,19 @@ def share_weights(hf_model: nn.Module, engine_model) -> None:
     Requires the HF model to have fused projections (qkv_proj, gate_up_proj).
     After this call, optimizer updates to HF parameters are immediately visible
     to the inference engine with zero copy overhead.
+
+    Supports Qwen3.5 mixed-layer models where full-attention layers expose
+    ``.self_attn.*`` weights and GatedDeltaNet layers expose ``.attn.*`` weights.
     """
     raw_hf = hf_model.module if hasattr(hf_model, "module") else hf_model
     hf_params = dict(raw_hf.named_parameters())
-    num_layers = sum(1 for name in hf_params if name.endswith(".self_attn.qkv_proj.weight"))
+
+    # Count total layers via input_layernorm — works for all architectures
+    # including Qwen3.5 which has a mix of .self_attn and .attn layers.
+    num_layers = sum(
+        1 for name in hf_params
+        if name.startswith("model.layers.") and name.endswith(".input_layernorm.weight")
+    )
 
     def _set(engine_key: str, hf_key: str) -> None:
         src = _get_hf_param(raw_hf, hf_key)
@@ -42,14 +51,27 @@ def share_weights(hf_model: nn.Module, engine_model) -> None:
 
     for i in range(num_layers):
         p = f"model.layers.{i}"
-        _set(f"{p}.self_attn.qkv_proj.weight", f"{p}.self_attn.qkv_proj.weight")
-        if f"{p}.self_attn.qkv_proj.bias" in hf_params:
-            _set(f"{p}.self_attn.qkv_proj.bias", f"{p}.self_attn.qkv_proj.bias")
-        if f"{p}.self_attn.q_norm.weight" in hf_params:
-            _set(f"{p}.self_attn.q_norm.weight", f"{p}.self_attn.q_norm.weight")
-        if f"{p}.self_attn.k_norm.weight" in hf_params:
-            _set(f"{p}.self_attn.k_norm.weight", f"{p}.self_attn.k_norm.weight")
-        _set(f"{p}.self_attn.o_proj.weight", f"{p}.self_attn.o_proj.weight")
+
+        if f"{p}.self_attn.qkv_proj.weight" in hf_params:
+            # Standard full-attention layer (Qwen2/Qwen3/Qwen3.5 full_attention/Llama/Gemma3)
+            _set(f"{p}.self_attn.qkv_proj.weight", f"{p}.self_attn.qkv_proj.weight")
+            if f"{p}.self_attn.qkv_proj.bias" in hf_params:
+                _set(f"{p}.self_attn.qkv_proj.bias", f"{p}.self_attn.qkv_proj.bias")
+            if f"{p}.self_attn.q_norm.weight" in hf_params:
+                _set(f"{p}.self_attn.q_norm.weight", f"{p}.self_attn.q_norm.weight")
+            if f"{p}.self_attn.k_norm.weight" in hf_params:
+                _set(f"{p}.self_attn.k_norm.weight", f"{p}.self_attn.k_norm.weight")
+            _set(f"{p}.self_attn.o_proj.weight", f"{p}.self_attn.o_proj.weight")
+
+        elif f"{p}.attn.in_proj_qkv.weight" in hf_params:
+            # Qwen3.5 GatedDeltaNet (linear_attention) layer
+            for proj in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+                _set(f"{p}.attn.{proj}.weight", f"{p}.attn.{proj}.weight")
+            _set(f"{p}.attn.conv1d.weight", f"{p}.attn.conv1d.weight")
+            if f"{p}.attn.conv1d.bias" in hf_params:
+                _set(f"{p}.attn.conv1d.bias", f"{p}.attn.conv1d.bias")
+            _set(f"{p}.attn.norm.weight", f"{p}.attn.norm.weight")
+
         _set(f"{p}.mlp.gate_up_proj.weight", f"{p}.mlp.gate_up_proj.weight")
         _set(f"{p}.mlp.down_proj.weight", f"{p}.mlp.down_proj.weight")
         _set(f"{p}.input_layernorm.weight", f"{p}.input_layernorm.weight")

@@ -9,7 +9,7 @@ import torch
 from liteopd.inference.attention import create_attention_backend
 from liteopd.inference.core import Batch, Context, Req, set_global_ctx
 from liteopd.inference.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from liteopd.inference.kvcache import create_kvcache_pool
+from liteopd.inference.kvcache import create_kvcache_pool, create_recurrent_pool
 from liteopd.inference.layers import set_rope_device
 from liteopd.inference.models import create_model, load_weight
 from liteopd.inference.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
@@ -107,6 +107,20 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+
+        # ======================= Recurrent state pool (Qwen3.5 DeltaNet) ========================
+        self.ctx.recurrent_pool = create_recurrent_pool(
+            model_config=config.model_config,
+            max_req=config.max_running_req,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        # Allocate CUDA-graph-safe working buffers for decode.
+        # max_padded_bs = max_running_req (+1 for the dummy request slot)
+        if self.ctx.recurrent_pool is not None:
+            self.ctx.recurrent_pool.init_working_buffers(
+                max_padded_bs=config.max_running_req + 1,
+            )
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -227,6 +241,14 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+
+        # ---- DeltaNet recurrent state: gather persistent → working buffer ----
+        # Must happen BEFORE the model forward (and before any CUDA graph replay)
+        # so that GatedDeltaNetAttn can read/write from a fixed-address tensor.
+        pool = self.ctx.recurrent_pool
+        if pool is not None and batch.is_decode:
+            pool.gather_for_decode(batch.padded_reqs)
+
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -234,6 +256,11 @@ class Engine:
             else:
                 logits = self.model.forward()
                 path = "model_forward"
+
+        # ---- DeltaNet recurrent state: scatter working → persistent pool ----
+        # Must happen AFTER the model forward so the updated states are written back.
+        if pool is not None and batch.is_decode:
+            pool.scatter_after_decode(batch.padded_reqs)
 
         if logits.shape[0] > 0:
             top_vals, top_ids = torch.topk(logits[0].float(), k=min(5, logits.shape[-1]))

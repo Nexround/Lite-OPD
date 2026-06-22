@@ -244,6 +244,10 @@ class Scheduler:
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
+        # Reset DeltaNet recurrent state for this slot (Qwen3.5 only; no-op for others)
+        pool = self.engine.ctx.recurrent_pool
+        if pool is not None:
+            pool.reset_request(req.table_idx)
 
     def _on_preempt(self, uid: int) -> None:
         """Hook for subclasses to react to preemption (e.g. reset output state)."""

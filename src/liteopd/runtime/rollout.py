@@ -110,7 +110,7 @@ class InProcessRolloutClient:
     @staticmethod
     def _warn_if_unvalidated_model(hf_config, model_config: ModelConfig, model_path: str) -> None:
         model_type = getattr(hf_config, "model_type", getattr(getattr(hf_config, "text_config", None), "model_type", "unknown"))
-        is_validated = model_type in {"qwen2", "qwen3", "llama", "gemma3_text"}
+        is_validated = model_type in {"qwen2", "qwen3", "qwen3_5_text", "llama", "gemma3_text"}
         if is_validated:
             return
         logger.warning(

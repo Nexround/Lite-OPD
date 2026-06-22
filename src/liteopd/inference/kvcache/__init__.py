@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .recurrent_pool import RecurrentStatePool, create_recurrent_pool
 
 
 class CacheManagerCreator(Protocol):
@@ -72,9 +73,11 @@ def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
 __all__ = [
     "create_kvcache_pool",
     "create_prefix_cache",
+    "create_recurrent_pool",
     "BaseKVCachePool",
     "BaseCacheHandle",
     "BasePrefixCache",
+    "RecurrentStatePool",
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",

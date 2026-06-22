@@ -9,8 +9,18 @@ from liteopd.inference.distributed import get_tp_info
 from liteopd.inference.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
-_SPLIT_DIM_1 = [".o_proj", ".down_proj"]
+_SPLIT_DIM_0 = [
+    ".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
+    # DeltaNet col-parallel projections (in_proj_qkv handled separately below)
+    ".in_proj_z", ".in_proj_b", ".in_proj_a",
+    # DeltaNet output norm weight [nv*dv] sharded by value-head to [local_nv*dv]
+    ".attn.norm",
+]
+_SPLIT_DIM_1 = [
+    ".o_proj", ".down_proj",
+    # DeltaNet row-parallel output projection
+    ".attn.out_proj",
+]
 
 # Merge groups: individual projections -> fused projection
 _MERGE_GROUPS = {
@@ -27,6 +37,51 @@ _SLOT_NAMES = {
     ".gate_proj": "gate",
     ".up_proj": "up",
 }
+
+
+def _shard_deltanet_qkv(
+    key: str,
+    value: torch.Tensor,
+    r: int,
+    n: int,
+    nk: int,
+    dk: int,
+    nv: int,
+    dv: int,
+) -> torch.Tensor | None:
+    """Component-wise TP shard for Qwen3.5 DeltaNet in_proj_qkv and conv1d.
+
+    Both tensors have output/channel dimension structured as [q|k|v]:
+      in_proj_qkv.weight : [2*nk*dk + nv*dv, hidden]  — shard dim 0 per component
+      conv1d.weight      : [2*nk*dk + nv*dv, 1, ks]   — same
+      conv1d.bias        : [2*nk*dk + nv*dv]           — same
+
+    A plain chunk(n, dim=0) would straddle the q/k/v boundary, so each
+    component is sharded independently then re-concatenated.
+
+    Returns the sharded tensor, or None if the key doesn't match.
+    """
+    if n == 1:
+        return None   # nothing to shard, fall through to _shard_tensor
+
+    if ".in_proj_qkv" in key or ".conv1d" in key:
+        q_size = nk * dk
+        k_size = nk * dk
+        v_size = nv * dv
+
+        if value.ndim == 1:
+            # bias: [2*q+v]
+            q = value[:q_size].chunk(n, dim=0)[r]
+            k = value[q_size : q_size + k_size].chunk(n, dim=0)[r]
+            v = value[q_size + k_size :].chunk(n, dim=0)[r]
+        else:
+            # weight or 3-D conv kernel: first dim is channels/out-features
+            q = value[:q_size].chunk(n, dim=0)[r]
+            k = value[q_size : q_size + k_size].chunk(n, dim=0)[r]
+            v = value[q_size + k_size :].chunk(n, dim=0)[r]
+        return torch.cat([q, k, v], dim=0).clone()
+
+    return None  # not a DeltaNet qkv/conv tensor
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
@@ -79,7 +134,20 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+
+                # Qwen3.5 DeltaNet qkv / conv1d need component-wise TP sharding
+                if config.is_qwen3_5 and config.linear_num_key_heads is not None:
+                    sharded = _shard_deltanet_qkv(
+                        name, raw,
+                        tp_info.rank, tp_info.size,
+                        config.linear_num_key_heads, config.linear_key_head_dim,
+                        config.linear_num_value_heads, config.linear_value_head_dim,
+                    )
+                    tensor = sharded if sharded is not None else _shard_tensor(
+                        name, raw, tp_info.rank, tp_info.size, config.num_kv_heads
+                    )
+                else:
+                    tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 
                 if (info := _get_merge_info(name)) is None:

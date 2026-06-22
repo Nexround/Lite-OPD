@@ -28,6 +28,22 @@ dev = [
   "pytest",
   "basedpyright",
 ]
+# Qwen3.5 GatedDeltaNet prefill acceleration.
+# Without this extra the code falls back to a PyTorch token loop (correct but slow).
+# Install: pip install "liteopd[qwen3_5]"
+# Note: flash-linear-attention requires a CUDA-capable GPU and matching torch version.
+qwen3_5 = [
+  # Prefill acceleration for GatedDeltaNet: chunk_gated_delta_rule kernel.
+  # Falls back to a PyTorch token loop when not installed.
+  "flash-linear-attention",
+  # Optimised causal depthwise Conv1d for DeltaNet preprocessing.
+  #   causal_conv1d_fn    — prefill: fused padding+conv+optional-SiLU, returns final state
+  #   causal_conv1d_update — decode: fused state-roll+conv in one kernel;
+  #                          conv_state_indices lets the kernel write directly into
+  #                          the persistent pool by table_idx, eliminating gather/scatter.
+  # Falls back to F.conv1d when not installed (correct but slower).
+  "causal-conv1d",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

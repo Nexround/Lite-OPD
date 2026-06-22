@@ -34,6 +34,15 @@ class ModelConfig:
     layer_types: List[str] | None = None
     sliding_window: int | None = None
     query_pre_attn_scalar: float | None = None
+    # Qwen3.5 GatedDeltaNet (linear_attention layers)
+    linear_num_key_heads: int | None = None
+    linear_num_value_heads: int | None = None
+    linear_key_head_dim: int | None = None
+    linear_value_head_dim: int | None = None
+    linear_conv_kernel_dim: int | None = None
+    # Qwen3.5 full_attention output gate
+    attn_output_gate: bool = False
+    full_attention_interval: int | None = None
 
     @property
     def attn_scale(self) -> float:
@@ -44,6 +53,10 @@ class ModelConfig:
     @property
     def is_gemma3(self) -> bool:
         return self.model_type == "gemma3_text"
+
+    @property
+    def is_qwen3_5(self) -> bool:
+        return self.model_type == "qwen3_5_text"
 
     @property
     def sliding_window_sizes(self) -> list[int]:
@@ -79,6 +92,11 @@ class ModelConfig:
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
 
+        # partial_rotary_factor: fraction of head_dim that participates in RoPE
+        # (e.g. Qwen3.5 uses 0.25; most models use 1.0 = full head_dim)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
         # Gemma3-specific fields
         embed_scale = 1.0
         rope_local_base_freq = None
@@ -91,6 +109,24 @@ class ModelConfig:
             layer_types = getattr(config, "layer_types", None)
             sliding_window = getattr(config, "sliding_window", None)
             query_pre_attn_scalar = getattr(config, "query_pre_attn_scalar", None)
+
+        # Qwen3.5-specific fields
+        linear_num_key_heads = None
+        linear_num_value_heads = None
+        linear_key_head_dim = None
+        linear_value_head_dim = None
+        linear_conv_kernel_dim = None
+        attn_output_gate = False
+        full_attention_interval = None
+        if model_type == "qwen3_5_text":
+            layer_types = getattr(config, "layer_types", None)
+            linear_num_key_heads = getattr(config, "linear_num_key_heads", None)
+            linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+            linear_key_head_dim = getattr(config, "linear_key_head_dim", None)
+            linear_value_head_dim = getattr(config, "linear_value_head_dim", None)
+            linear_conv_kernel_dim = getattr(config, "linear_conv_kernel_dim", 4)
+            attn_output_gate = getattr(config, "attn_output_gate", False)
+            full_attention_interval = getattr(config, "full_attention_interval", 4)
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -105,7 +141,7 @@ class ModelConfig:
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
                 head_dim=head_dim,
-                rotary_dim=head_dim,
+                rotary_dim=rotary_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
@@ -117,4 +153,11 @@ class ModelConfig:
             layer_types=layer_types,
             sliding_window=sliding_window,
             query_pre_attn_scalar=query_pre_attn_scalar,
+            linear_num_key_heads=linear_num_key_heads,
+            linear_num_value_heads=linear_num_value_heads,
+            linear_key_head_dim=linear_key_head_dim,
+            linear_value_head_dim=linear_value_head_dim,
+            linear_conv_kernel_dim=linear_conv_kernel_dim,
+            attn_output_gate=attn_output_gate,
+            full_attention_interval=full_attention_interval,
         )

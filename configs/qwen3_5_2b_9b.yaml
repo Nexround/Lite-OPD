@@ -1,0 +1,41 @@
+loss: reverse_kl
+student_model: /path/to/Qwen3.5-2B
+teacher_model: /path/to/Qwen3.5-9B
+train_dataset: /path/to/math_metamath_openr1_1to1
+eval_dataset: /path/to/omni_math_4_5/test.jsonl
+output_dir: results/qwen3_5_2b_9b
+
+distributed_strategy: zero2
+max_pack_tokens: 65536
+
+learning_rate: 5e-6
+global_batch_size: 128
+
+# Qwen3.5 GatedDeltaNet layers cannot use CUDA-graph-captured decode steps
+# until a flash-linear-attention kernel backend is integrated.  Disable
+# graph capture by setting cuda_graph_max_bs: 0 (all forward passes run
+# eagerly).  Re-enable once DeltaNet graph-capture support is added.
+generation_cuda_graph_max_bs: 0
+
+generation_mem_fraction_static: 0.85
+generation_max_running_req: 128
+generation_page_size: 16
+generation_attention_backend: fi
+generation_admission_reserve_tokens: 2048
+generation_max_preemptions_per_req: 3
+
+enable_gradient_checkpointing: true
+temperature: 0.6
+top_p: 0.9
+generation_top_k: 20
+max_total_tokens: 16384
+train_subset_size: 100000
+eval_subset_size: 200
+validation_subset_size: 200
+eval_every_steps: 50
+kl_backward_mode: two_stage
+log_every: 1
+max_steps: 400
+num_epochs: 1
+save_every_steps: 100
+skip_eval: false

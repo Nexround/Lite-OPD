@@ -56,10 +56,18 @@ class FusedGateUpLinear(nn.Module):
 def fuse_model_projections(model: nn.Module) -> nn.Module:
     """Replace separate q/k/v and gate/up projections with fused versions in-place.
 
-    Supports Qwen2, Qwen3, Llama, and Gemma3 architectures. Returns the same model.
+    Supports Qwen2, Qwen3, Qwen3.5, Llama, and Gemma3 architectures.
+    Returns the same model.
+
+    For Qwen3.5 the transformer block alternates between standard full-attention
+    layers (``layer.self_attn``) and GatedDeltaNet layers (``layer.attn``).
+    Only full-attention layers are fused here; DeltaNet layers already use a
+    single fused ``in_proj_qkv`` projection in HF and do not need further fusion.
     """
     for layer in model.model.layers:
-        _fuse_attention(layer.self_attn)
+        if hasattr(layer, "self_attn"):
+            _fuse_attention(layer.self_attn)
+        # DeltaNet layers (layer.attn) are skipped: in_proj_qkv is already fused
         _fuse_mlp(layer.mlp)
     return model
 
@@ -108,9 +116,15 @@ def _fuse_attention(attn: nn.Module) -> None:
 
     model_type = getattr(getattr(attn, "config", None), "model_type", None)
     has_qk_norm = hasattr(attn, "q_norm") and hasattr(attn, "k_norm")
+    # Qwen3.5 full_attention has output gate: q_proj doubled, attn_output_gate=True
+    has_output_gate = getattr(getattr(attn, "config", None), "attn_output_gate", False)
     if model_type == "gemma3_text":
         attn.forward = types.MethodType(_gemma3_attention_forward, attn)
+    elif has_qk_norm and has_output_gate:
+        # Qwen3.5 full_attention: QK-norm + output gate
+        attn.forward = types.MethodType(_qwen3_5_full_attention_forward, attn)
     elif has_qk_norm:
+        # Qwen3: QK-norm only
         attn.forward = types.MethodType(_qwen3_attention_forward, attn)
     elif model_type == "llama":
         attn.forward = types.MethodType(_llama_attention_forward, attn)
@@ -320,6 +334,70 @@ def _gemma3_attention_forward(self, hidden_states, **kwargs):
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+def _qwen3_5_full_attention_forward(self, hidden_states, **kwargs):
+    """Fused forward for Qwen3.5 full_attention layers.
+
+    Key difference vs Qwen3: the Q projection is doubled (q + output_gate).
+    After attention, output is multiplied element-wise by sigmoid(gate).
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+    position_embeddings = kwargs.get("position_embeddings")
+    attention_mask = kwargs.get("attention_mask")
+    past_key_values = kwargs.get("past_key_values") or kwargs.get("past_key_value")
+    cache_position = kwargs.get("cache_position")
+
+    input_shape = hidden_states.shape[:-1]
+    # qkv_proj was built from q_proj (2× size) + k_proj + v_proj
+    q_and_gate, k, v = self.qkv_proj(hidden_states)
+
+    # Split doubled Q: first half = query, second half = output gate
+    actual_q_dim = q_and_gate.shape[-1] // 2
+    q_raw, gate = q_and_gate.split(actual_q_dim, dim=-1)
+
+    hidden_shape_q = (*input_shape, -1, self.head_dim)
+    hidden_shape_kv = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_norm(q_raw.view(hidden_shape_q)).transpose(1, 2)
+    key_states = self.k_norm(k.view(hidden_shape_kv)).transpose(1, 2)
+    value_states = v.view(hidden_shape_kv).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen3_5.modeling_qwen3_5 import eager_attention_forward
+
+    attention_interface = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=getattr(self, "sliding_window", None),
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
+    # Apply output gate: attn_out * sigmoid(gate)
+    attn_output = attn_output * torch.sigmoid(gate)
+
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
 

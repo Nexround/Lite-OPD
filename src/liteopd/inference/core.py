@@ -8,7 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from liteopd.inference.attention import BaseAttnBackend, BaseAttnMetadata
-    from liteopd.inference.kvcache import BaseCacheHandle, BaseKVCachePool
+    from liteopd.inference.kvcache import BaseCacheHandle, BaseKVCachePool, RecurrentStatePool
 
 
 @dataclass
@@ -108,6 +108,8 @@ class Context:
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    # Qwen3.5 DeltaNet recurrent state pool; None for non-Qwen3.5 models
+    recurrent_pool: RecurrentStatePool | None = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

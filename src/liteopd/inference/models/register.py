@@ -7,6 +7,8 @@ _MODEL_REGISTRY = {
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
     "Gemma3ForCausalLM": (".gemma3", "Gemma3ForCausalLM"),
+    # Qwen3.5: multimodal model class; text weights are extracted via text_config
+    "Qwen3_5ForConditionalGeneration": (".qwen3_5", "Qwen3_5ForCausalLM"),
 }
 
 
