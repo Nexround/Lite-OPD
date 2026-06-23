@@ -17,8 +17,9 @@ GatedDeltaNet (the other 3/4 of layers)
     decay_h = exp(g_t[kh])
     S[h] ← decay_h * S[h] + outer(v_t[h] - S[h]@k_t[kh], b_t[kh] * k_t[kh])
     o_t[h] = S[h] @ q_t[kh]
-  CUDA-graph-safe decode: all state accesses go through the working buffer
-  (pre-gathered before, scattered back after, by Engine.forward_batch).
+  Decode state accesses go through the working buffer (pre-gathered before,
+  scattered back after, by Engine.forward_batch).  Graph capture is disabled
+  until the FLA kernel backend is integrated — see "CUDA-graph capture" note.
 
 Tensor parallelism
   Full-attention  → same as Qwen3 (already TP-aware via RopeAttn / LinearQKV)
@@ -28,6 +29,14 @@ Tensor parallelism
 Flash-linear-attention (optional)
   If ``flash-linear-attention`` is installed, prefill uses ``chunk_gated_delta_rule``
   for O(T / chunk) speedup.  Falls back to a PyTorch loop otherwise.
+
+CUDA-graph capture — currently DISABLED for Qwen3.5
+  GatedDeltaNet decode steps cannot be captured into a CUDA graph until the
+  flash-linear-attention kernel backend is fully integrated (the FLA decode
+  kernel exposes a fixed-address state API that the graph runner requires).
+  Set ``cuda_graph_max_bs: 0`` in any Qwen3.5 config to run all forward passes
+  eagerly.  Re-enable once DeltaNet graph-capture support is added.
+  See: configs/qwen3_5_*.yaml → generation_cuda_graph_max_bs: 0
 
 Weight-name compatibility with HuggingFace Qwen3.5
   Full-attention layers   → model.layers.{i}.self_attn.*
@@ -192,8 +201,9 @@ class GatedDeltaNetAttn(BaseOP):
       norm         local weight  [local_nv*dv]
       out_proj     row-parallel  [nv*dv → hidden]           + all-reduce
 
-    Decode is CUDA-graph-safe: uses working buffers (pre-gathered by
-    Engine.forward_batch) instead of dynamic pool indexing.
+    Decode uses working buffers (pre-gathered by Engine.forward_batch) instead
+    of dynamic pool indexing.  CUDA-graph capture is not yet enabled — the FLA
+    kernel backend must be integrated first (see module docstring).
 
     Prefill uses the flash-linear-attention chunk kernel when available,
     falling back to a PyTorch token loop otherwise.
@@ -240,6 +250,12 @@ class GatedDeltaNetAttn(BaseOP):
         self._ks              = ks
         self._kv_groups       = nv // nk    # GQA factor (invariant under TP)
         self._local_qkv_out   = local_conv_ch
+        # Maps each value head to its corresponding key head (GQA broadcast).
+        # Lazily initialised on first forward call so we have the right device.
+        # Cached as a fixed tensor to avoid torch.arange allocation on every
+        # decode step — a prerequisite for CUDA-graph capture once FLA support
+        # lands (see module docstring).
+        self._kh_idx: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Main forward
@@ -311,7 +327,7 @@ class GatedDeltaNetAttn(BaseOP):
           • conv_state = pool.conv_buffer[li]  [n_slots, conv_ch, ks-1]
           • conv_state_indices = pool.table_indices_buf[:B]  (pre-filled in gather)
           • The kernel reads/writes the correct pool slots directly — zero extra
-            gather/scatter for conv state, CUDA-graph-safe
+            gather/scatter for conv state (graph-capture-ready once FLA lands)
         """
         li      = self._local_delta_idx
         ks      = self._ks
@@ -416,7 +432,9 @@ class GatedDeltaNetAttn(BaseOP):
         local_nk    = self._local_nk
         dk, dv      = self._dk, self._dv
 
-        kh_idx = torch.arange(local_nv, device=q.device) // kv_groups  # [local_nv]
+        if self._kh_idx is None:
+            self._kh_idx = torch.arange(local_nv, device=q.device) // kv_groups
+        kh_idx = self._kh_idx  # [local_nv]
 
         outputs: List[torch.Tensor] = []
         offset = 0
@@ -487,7 +505,7 @@ class GatedDeltaNetAttn(BaseOP):
         return torch.cat(outputs, dim=0)    # [total_tokens, local_nv, dv]
 
     # ------------------------------------------------------------------
-    # DeltaNet recurrent forward — decode (CUDA-graph-safe)
+    # DeltaNet recurrent forward — decode
     # ------------------------------------------------------------------
 
     def _decode_deltanet(
@@ -499,14 +517,24 @@ class GatedDeltaNetAttn(BaseOP):
         """Single-step DeltaNet for the full padded decode batch.
 
         Uses pool.working_state (pre-gathered by Engine.forward_batch).
-        Fully vectorised — no Python loops — so CUDA-graph-safe.
+        Fully vectorised — no Python loops.
+
+        CUDA-graph status: NOT YET SAFE.
+          The graph-capture path requires the flash-linear-attention kernel
+          backend to expose a fixed-address decode API.  Until that lands,
+          all Qwen3.5 configs must set ``cuda_graph_max_bs: 0``.  See the
+          module docstring for details.
         """
         li        = self._local_delta_idx
-        kv_groups = self._kv_groups
         local_nv  = self._local_nv
 
         B = q.shape[0]   # padded batch size
-        kh_idx = torch.arange(local_nv, device=q.device) // kv_groups  # [local_nv]
+        # Use the cached (fixed-address) head-index tensor — avoids a
+        # torch.arange allocation on every decode step, which would prevent
+        # graph capture even after the FLA backend is integrated.
+        if self._kh_idx is None:
+            self._kh_idx = torch.arange(local_nv, device=q.device) // self._kv_groups
+        kh_idx = self._kh_idx  # [local_nv]
 
         # --- load state from working buffer (fixed address) ---------------
         S = pool.working_state[:B, li].float()  # [B, local_nv, dk, dv]
