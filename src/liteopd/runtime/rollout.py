@@ -158,6 +158,45 @@ class InProcessRolloutClient:
         self.last_output_token_counts = [len(r["token_ids"]) for r in results]
         return [r["text"] for r in results]
 
+    def generate_from_prompts(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        max_concurrency: int | None = None,
+    ) -> List[str]:
+        """Generate from pre-built prompt strings, bypassing ``apply_chat_template``.
+
+        Use this instead of :meth:`generate_messages` when the caller has
+        already embedded a gold prefix into the prompt via
+        ``tokenizer.apply_chat_template(..., continue_final_message=True)``.
+        The scheduler sees a raw string and generates the continuation from
+        the end of that string, exactly as in the standard OPD path.
+
+        Args:
+            prompts: Pre-formatted prompt strings (one per sample).
+            max_tokens: Maximum number of tokens to generate per prompt.
+            temperature: Sampling temperature.
+            top_p: Nucleus-sampling p.
+            top_k: Top-k sampling limit (``None`` → disabled).
+            max_concurrency: Unused; kept for API symmetry with
+                :meth:`generate_messages`.
+
+        Returns:
+            List of generated continuation strings (no prompt included).
+        """
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k if top_k is not None else -1,
+            max_tokens=max_tokens,
+        )
+        results = self._scheduler.generate(prompts, sampling_params)
+        self.last_output_token_counts = [len(r["token_ids"]) for r in results]
+        return [r["text"] for r in results]
+
     def generate_request_batch(
         self,
         requests_batch: List[Dict[str, Any]],

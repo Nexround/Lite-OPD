@@ -75,6 +75,22 @@ class TrainConfig:
     max_prompt_length: int = 1024
     warmup_ratio: float = 0.0
     cosine_annealing: bool = False
+    # ---------------------------------------------------------------------------
+    # Hybrid SFT + OPD training
+    # ---------------------------------------------------------------------------
+    # Dataset field that contains the gold prefix text.  When set, each training
+    # sample is split into a gold-prefix region (supervised with cross-entropy
+    # against the gold tokens) and a student-generated continuation region
+    # (supervised with KL divergence against the teacher, as in standard OPD).
+    # Set to None (default) to disable hybrid mode and run pure OPD.
+    gold_prefix_field: str | None = None
+    # Hard cap on gold-prefix length in tokens.  Prefixes longer than this are
+    # truncated at the token boundary.  None means no cap.
+    gold_prefix_max_tokens: int | None = None
+    # Relative weight of the SFT (CE) loss with respect to the OPD (KL) loss.
+    # Both losses are token-count-normalised before weighting, so 1.0 gives
+    # equal per-token influence; values > 1 amplify the SFT signal.
+    sft_loss_weight: float = 1.0
 
 
 def load_train_config(path: str | Path) -> TrainConfig:
@@ -133,4 +149,8 @@ def load_train_config(path: str | Path) -> TrainConfig:
         cfg.eval_subset_size = -1
     if cfg.validation_subset_size < 0:
         raise ValueError("validation_subset_size must be non-negative")
+    if cfg.gold_prefix_max_tokens is not None and cfg.gold_prefix_max_tokens <= 0:
+        raise ValueError("gold_prefix_max_tokens must be a positive integer when set")
+    if cfg.sft_loss_weight <= 0:
+        raise ValueError("sft_loss_weight must be positive")
     return cfg

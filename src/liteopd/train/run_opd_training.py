@@ -26,7 +26,7 @@ from liteopd.eval.scoring import (
     compute_named_accuracies_with_rollout_client_batched as _compute_named_accuracies_batched,
     distributed_eval as _distributed_eval,
 )
-from liteopd.losses import chunk_loss_from_hidden_chunk, chunked_kl_from_hidden, chunked_kl_from_logits, distillation_loss
+from liteopd.losses import chunk_loss_from_hidden_chunk, chunked_kl_from_hidden, chunked_kl_from_logits, distillation_loss, sft_loss_from_hidden_chunk
 from liteopd.train.config import load_train_config
 from liteopd.train.logging import JsonlLogger
 from liteopd.train.packing import pack_sequences
@@ -56,6 +56,62 @@ def get_gold_text(example: dict) -> str:
         if value:
             return value
     raise ValueError(f"example missing answer field among answer/solution/canonical_solution: {example.keys()}")
+
+
+def get_gold_prefix_text(example: dict, gold_prefix_field: str | None, gold_prefix_max_tokens: int | None, tokenizer) -> str:
+    """Return the gold-prefix text for *example*, or an empty string.
+
+    When *gold_prefix_field* is None hybrid mode is disabled and the function
+    always returns ``""``.  When the field is present the text is truncated to
+    *gold_prefix_max_tokens* tokens (approximate; tokenised without special
+    tokens) before being returned.
+    """
+    if not gold_prefix_field:
+        return ""
+    text = example.get(gold_prefix_field, "") or ""
+    text = str(text).strip()
+    if not text:
+        return ""
+    if gold_prefix_max_tokens is not None:
+        ids = tokenizer(text, add_special_tokens=False).input_ids
+        if len(ids) > gold_prefix_max_tokens:
+            # Decode the truncated token sequence back to text
+            text = tokenizer.decode(ids[:gold_prefix_max_tokens], skip_special_tokens=False)
+    return text
+
+
+def build_rollout_prompt_with_gold(
+    tokenizer,
+    question: str,
+    gold_prefix: str,
+    chat_template_kwargs: dict | None = None,
+) -> str:
+    """Build the rollout prompt string for hybrid SFT+OPD training.
+
+    Embeds *gold_prefix* as the beginning of the assistant turn so that the
+    rollout engine generates only the *continuation* after the gold prefix.
+    Uses ``continue_final_message=True`` so the tokeniser does not close the
+    assistant block, allowing seamless continuation.
+
+    For samples where *gold_prefix* is empty this degrades to the standard
+    ``build_prompt`` path (``add_generation_prompt=True``).
+    """
+    if not gold_prefix:
+        return build_prompt(tokenizer, question, chat_template_kwargs)
+    messages = [
+        {"role": "user",      "content": question},
+        {"role": "assistant", "content": gold_prefix},
+    ]
+    kwargs = dict(chat_template_kwargs or {})
+    # continue_final_message=True: keep the assistant turn open so the model
+    # continues generating from the end of gold_prefix.
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        continue_final_message=True,
+        **kwargs,
+    )
 
 
 def chat_template_kwargs_for_model(model_name: str) -> dict | None:
@@ -212,20 +268,74 @@ def refresh_weights(
     return elapsed
 
 
-def batch_rollout_and_loss_with_client(rollout_client, student, teacher, tokenizer, prompts: List[str], messages_batch: List[list[dict]], loss_name: str, device, top_p: float, temperature: float, top_k: int | None, max_new_tokens: int, logger=None, step: int | None = None, profile_memory: bool = False, do_backward: bool = False, kl_backward_mode: str = "chunk", sync_grads: bool = False, responses: List[str] | None = None, debug_event=None, slice_teacher_logits_to_student: bool = False, timing_stats: dict | None = None, max_pack_tokens: int = 32768) -> torch.Tensor:
+def batch_rollout_and_loss_with_client(
+    rollout_client,
+    student,
+    teacher,
+    tokenizer,
+    prompts: List[str],
+    messages_batch: List[list[dict]],
+    loss_name: str,
+    device,
+    top_p: float,
+    temperature: float,
+    top_k: int | None,
+    max_new_tokens: int,
+    logger=None,
+    step: int | None = None,
+    profile_memory: bool = False,
+    do_backward: bool = False,
+    kl_backward_mode: str = "chunk",
+    sync_grads: bool = False,
+    responses: List[str] | None = None,
+    debug_event=None,
+    slice_teacher_logits_to_student: bool = False,
+    timing_stats: dict | None = None,
+    max_pack_tokens: int = 32768,
+    # Hybrid SFT+OPD parameters
+    gold_prefixes: List[str] | None = None,
+    sft_loss_weight: float = 1.0,
+) -> torch.Tensor:
+    """Rollout, pack, forward, and backward for one training step.
+
+    When *gold_prefixes* is provided (hybrid SFT+OPD mode), each sample is
+    split into two regions:
+
+    * **Gold-prefix region** — the gold tokens embedded inside the prompt
+      (before the student-generated continuation).  Loss: cross-entropy
+      against the gold token IDs, weighted by *sft_loss_weight*.
+    * **OPD region** — the student-generated continuation.  Loss: KL
+      divergence against the teacher (same as standard OPD).
+
+    Both regions contribute to the same backward pass; the two-stage mode
+    accumulates their gradients into ``packed_grad_accum`` before the single
+    Stage-2 backbone backward, leaving the backward interface unchanged.
+    """
     if responses is None:
         if debug_event is not None:
             debug_event("micro_rollout_generate_start", step=step, sample_count=len(messages_batch), max_new_tokens=max_new_tokens)
         rollout_start = time.perf_counter()
-        responses = rollout_client.generate_messages(
-            messages_batch,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            chat_template_kwargs=chat_template_kwargs_for_model(rollout_client.model),
-            max_concurrency=len(messages_batch),
-        )
+        # Hybrid mode: prompts already contain the gold prefix; use
+        # generate_from_prompts to skip a redundant apply_chat_template call.
+        if gold_prefixes is not None:
+            responses = rollout_client.generate_from_prompts(
+                prompts,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_concurrency=len(prompts),
+            )
+        else:
+            responses = rollout_client.generate_messages(
+                messages_batch,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                chat_template_kwargs=chat_template_kwargs_for_model(rollout_client.model),
+                max_concurrency=len(messages_batch),
+            )
         if debug_event is not None:
             debug_event("micro_rollout_generate_end", step=step, response_count=len(responses))
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -236,6 +346,7 @@ def batch_rollout_and_loss_with_client(rollout_client, student, teacher, tokeniz
                 debug_event("micro_rollout_barrier_end", step=step)
         if timing_stats is not None:
             timing_stats["rollout_seconds"] = timing_stats.get("rollout_seconds", 0.0) + (time.perf_counter() - rollout_start)
+
     student_ddp = student if hasattr(student, "require_backward_grad_sync") else None
     model_for_forward = student.module if hasattr(student, "module") else student
     lm_head_params = [param for param in model_for_forward.lm_head.parameters() if param.requires_grad]
@@ -246,7 +357,7 @@ def batch_rollout_and_loss_with_client(rollout_client, student, teacher, tokeniz
     student_forward_seconds = 0.0
     student_backward_seconds = 0.0
     pack_sequences_start = time.perf_counter()
-    packed_batches = pack_sequences(tokenizer, prompts, responses, device, max_pack_tokens)
+    packed_batches = pack_sequences(tokenizer, prompts, responses, device, max_pack_tokens, gold_prefixes=gold_prefixes)
     student_forward_seconds += time.perf_counter() - pack_sequences_start
 
     total_response_tokens = sum(sum(pb.response_token_counts) for pb in packed_batches)
@@ -269,76 +380,183 @@ def batch_rollout_and_loss_with_client(rollout_client, student, teacher, tokeniz
 
         packed_grad_accum = torch.zeros_like(student_hidden_packed) if (do_backward and kl_backward_mode == "two_stage") else None
         offset = 0
-        for sample_index, (seq_len, prompt_len, response_tokens) in enumerate(zip(packed.seq_lengths, packed.prompt_lengths, packed.response_token_counts)):
-            response_start = offset + prompt_len - 1
-            response_end = offset + seq_len
-            student_hidden_slice = student_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
-            teacher_hidden_slice = teacher_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
+        for sample_index, (seq_len, prompt_len, response_tokens) in enumerate(
+            zip(packed.seq_lengths, packed.prompt_lengths, packed.response_token_counts)
+        ):
+            gold_len     = packed.gold_prefix_lengths[sample_index]
+            is_hybrid    = gold_len > 0
 
-            seq_tokens = student_hidden_slice.shape[1]
-            chunk_tokens = max(1, math.ceil(seq_tokens / 8))
-            chunk_ranges = [(start, min(seq_tokens, start + chunk_tokens)) for start in range(0, seq_tokens, chunk_tokens)]
-            total_tokens = sum((end - start) for start, end in chunk_ranges)
+            # ── Region boundaries in the packed sequence ──────────────────
+            #
+            # Layout of input_ids for a hybrid sample:
+            #   [base_prompt | gold_prefix | continuation]
+            #    <──────── prompt_len ────────> <opd_tokens>
+            #
+            # hidden[i] predicts input_ids[i+1], so:
+            #   SFT targets: input_ids[sft_start+1 : sft_end+1] = gold tokens
+            #   OPD region:  hidden[response_start : response_end]
+            #
+            response_start = offset + prompt_len - 1          # start of OPD region (unchanged)
+            response_end   = offset + seq_len                  # end of OPD region   (unchanged)
+            sft_start      = response_start - gold_len         # start of SFT region (= response_start when no gold)
+            # sft_end == response_start (SFT and OPD are adjacent, no overlap)
+
+            # OPD token count (continuation only; unchanged from pure-OPD)
+            opd_tokens = response_end - response_start
+            # Total supervised tokens for intra-sample normalisation
+            total_tokens = gold_len + opd_tokens
+
+            # Combined hidden slice: covers SFT region + OPD region
+            combined_start = sft_start           # == response_start when no gold
+            combined_end   = response_end
+
             is_last_sample = sample_index == len(packed.seq_lengths) - 1
 
+            # Teacher hidden: OPD region only (not needed for SFT)
+            teacher_hidden_slice = teacher_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
+
+            # ── two_stage backward ────────────────────────────────────────
             if kl_backward_mode == "two_stage":
-                hidden_leaf = student_hidden_slice.detach().requires_grad_(True)
+                # Detach the combined region and treat it as a single leaf so
+                # that Stage-1 (lm_head + SFT/KL grad computation) and
+                # Stage-2 (backbone backward) are completely separated.
+                hidden_leaf       = student_hidden_packed[0, combined_start:combined_end, :].unsqueeze(0).detach().requires_grad_(True)
                 hidden_grad_accum = torch.zeros_like(hidden_leaf)
                 weighted_loss_value = 0.0
-                for chunk_index, (start, end) in enumerate(chunk_ranges):
-                    token_count = end - start
-                    hidden_leaf_chunk = hidden_leaf[:, start:end, :]
-                    token_loss = chunk_loss_from_hidden_chunk(
-                        hidden_leaf_chunk, teacher_hidden_slice[:, start:end, :],
-                        model_for_forward.lm_head, teacher.lm_head,
-                        loss_name=loss_name, slice_teacher_logits_to_student=slice_teacher_logits_to_student,
+
+                # ── Stage-1a: SFT (gold-prefix CE) ────────────────────────
+                if is_hybrid:
+                    sft_chunk   = hidden_leaf[:, :gold_len, :]                                         # (1, gold_len, H)
+                    target_ids  = packed.input_ids[0, combined_start + 1 : combined_start + gold_len + 1]   # (gold_len,)
+                    sft_loss    = sft_loss_from_hidden_chunk(sft_chunk, target_ids, model_for_forward.lm_head)
+                    sft_scale   = (gold_len / total_tokens) * sft_loss_weight
+                    weighted_loss_value += float((sft_loss * gold_len / total_tokens).detach().cpu())
+                    grad_scale_sft = (sft_scale * response_tokens / total_response_tokens) if do_backward else sft_scale
+                    sft_grads = torch.autograd.grad(
+                        sft_loss * grad_scale_sft, [hidden_leaf, *lm_head_params],
+                        retain_graph=False, allow_unused=True,
                     )
-                    scale = token_count / total_tokens
-                    weighted_loss_value += float((token_loss * scale).detach().cpu())
-                    grad_scale = (scale * response_tokens / total_response_tokens) if do_backward else scale
-                    grad_outputs = torch.autograd.grad(token_loss * grad_scale, [hidden_leaf, *lm_head_params], retain_graph=False, allow_unused=True)
-                    if grad_outputs[0] is not None:
-                        hidden_grad_accum.add_(grad_outputs[0])
-                    for param, grad in zip(lm_head_params, grad_outputs[1:]):
+                    if sft_grads[0] is not None:
+                        hidden_grad_accum.add_(sft_grads[0])
+                    for param, grad in zip(lm_head_params, sft_grads[1:]):
                         if grad is not None:
                             if param.grad is None:
                                 param.grad = grad.detach().clone()
                             else:
                                 param.grad.add_(grad.detach())
-                if do_backward:
-                    packed_grad_accum[0, response_start:response_end, :] = hidden_grad_accum.squeeze(0)
 
+                # ── Stage-1b: OPD (chunked KL) ────────────────────────────
+                # Index into hidden_leaf with gold_len offset so that both
+                # SFT and OPD gradients are accumulated onto the same leaf.
+                opd_chunk_tokens = max(1, math.ceil(opd_tokens / 8))
+                opd_chunk_ranges = [
+                    (s, min(opd_tokens, s + opd_chunk_tokens))
+                    for s in range(0, opd_tokens, opd_chunk_tokens)
+                ]
+                for chunk_index, (start, end) in enumerate(opd_chunk_ranges):
+                    token_count      = end - start
+                    hidden_leaf_chunk = hidden_leaf[:, gold_len + start : gold_len + end, :]
+                    kl_loss = chunk_loss_from_hidden_chunk(
+                        hidden_leaf_chunk, teacher_hidden_slice[:, start:end, :],
+                        model_for_forward.lm_head, teacher.lm_head,
+                        loss_name=loss_name, slice_teacher_logits_to_student=slice_teacher_logits_to_student,
+                    )
+                    scale = token_count / total_tokens
+                    weighted_loss_value += float((kl_loss * scale).detach().cpu())
+                    grad_scale = (scale * response_tokens / total_response_tokens) if do_backward else scale
+                    kl_grads = torch.autograd.grad(
+                        kl_loss * grad_scale, [hidden_leaf, *lm_head_params],
+                        retain_graph=False, allow_unused=True,
+                    )
+                    if kl_grads[0] is not None:
+                        hidden_grad_accum.add_(kl_grads[0])
+                    for param, grad in zip(lm_head_params, kl_grads[1:]):
+                        if grad is not None:
+                            if param.grad is None:
+                                param.grad = grad.detach().clone()
+                            else:
+                                param.grad.add_(grad.detach())
+
+                # Scatter the combined gradient back into packed_grad_accum
+                if do_backward:
+                    packed_grad_accum[0, combined_start:combined_end, :] = hidden_grad_accum.squeeze(0)
+
+            # ── chunk backward ────────────────────────────────────────────
             elif kl_backward_mode == "chunk":
                 weighted_loss_value = 0.0
-                for chunk_index, (start, end) in enumerate(chunk_ranges):
+                opd_chunk_tokens = max(1, math.ceil(opd_tokens / 8))
+                opd_chunk_ranges = [
+                    (s, min(opd_tokens, s + opd_chunk_tokens))
+                    for s in range(0, opd_tokens, opd_chunk_tokens)
+                ]
+                has_opd = len(opd_chunk_ranges) > 0
+
+                # SFT region: single backward; must retain graph if OPD follows
+                if is_hybrid:
+                    sft_hidden = student_hidden_packed[0, sft_start:response_start, :].unsqueeze(0)
+                    target_ids = packed.input_ids[0, sft_start + 1 : response_start + 1]
+                    sft_loss   = sft_loss_from_hidden_chunk(sft_hidden, target_ids, model_for_forward.lm_head)
+                    sft_scale  = (gold_len / total_tokens) * sft_loss_weight
+                    weighted_loss_value += float((sft_loss * gold_len / total_tokens).detach().cpu())
+                    if do_backward:
+                        student_backward_start = time.perf_counter()
+                        # retain_graph=True because the OPD region shares the same
+                        # student_hidden_packed computation graph
+                        (sft_loss * sft_scale * response_tokens / total_response_tokens).backward(retain_graph=True)
+                        student_backward_seconds += time.perf_counter() - student_backward_start
+
+                # OPD region: chunked as in standard OPD
+                opd_hidden_slice = student_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
+                for chunk_index, (start, end) in enumerate(opd_chunk_ranges):
                     token_count = end - start
-                    token_loss = chunk_loss_from_hidden_chunk(
-                        student_hidden_slice[:, start:end, :],
+                    kl_loss = chunk_loss_from_hidden_chunk(
+                        opd_hidden_slice[:, start:end, :],
                         teacher_hidden_slice[:, start:end, :],
                         model_for_forward.lm_head, teacher.lm_head,
                         loss_name=loss_name, slice_teacher_logits_to_student=slice_teacher_logits_to_student,
                     )
                     scale = token_count / total_tokens
-                    weighted_loss_value += float((token_loss * scale).detach().cpu())
+                    weighted_loss_value += float((kl_loss * scale).detach().cpu())
                     if do_backward:
-                        is_last_chunk = is_last_packed and is_last_sample and chunk_index == len(chunk_ranges) - 1
+                        is_last_chunk = is_last_packed and is_last_sample and chunk_index == len(opd_chunk_ranges) - 1
                         student_backward_start = time.perf_counter()
-                        (token_loss * scale * response_tokens / total_response_tokens).backward(retain_graph=not is_last_chunk)
+                        (kl_loss * scale * response_tokens / total_response_tokens).backward(retain_graph=not is_last_chunk)
                         student_backward_seconds += time.perf_counter() - student_backward_start
-                    del token_loss
+                    del kl_loss
 
-            else:  # sample
-                sample_loss = chunked_kl_from_hidden(
-                    student_hidden_slice, teacher_hidden_slice,
+            # ── sample backward ───────────────────────────────────────────
+            else:
+                opd_chunk_tokens = max(1, math.ceil(opd_tokens / 8))
+                opd_hidden_slice = student_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
+                kl_loss = chunked_kl_from_hidden(
+                    opd_hidden_slice, teacher_hidden_slice,
                     model_for_forward.lm_head, teacher.lm_head,
-                    loss_name=loss_name, chunk_tokens=chunk_tokens,
+                    loss_name=loss_name, chunk_tokens=opd_chunk_tokens,
                     slice_teacher_logits_to_student=slice_teacher_logits_to_student,
                 )
-                weighted_loss_value = float(sample_loss.detach().cpu())
-                if do_backward:
-                    student_backward_start = time.perf_counter()
-                    (sample_loss * response_tokens / total_response_tokens).backward()
-                    student_backward_seconds += time.perf_counter() - student_backward_start
+                # Scale KL loss by its token fraction
+                opd_fraction = opd_tokens / total_tokens if total_tokens > 0 else 1.0
+                weighted_loss_value = float(kl_loss.detach().cpu()) * opd_fraction
+
+                if is_hybrid:
+                    sft_hidden = student_hidden_packed[0, sft_start:response_start, :].unsqueeze(0)
+                    target_ids = packed.input_ids[0, sft_start + 1 : response_start + 1]
+                    sft_loss   = sft_loss_from_hidden_chunk(sft_hidden, target_ids, model_for_forward.lm_head)
+                    sft_fraction = (gold_len / total_tokens) * sft_loss_weight if total_tokens > 0 else 0.0
+                    weighted_loss_value += float(sft_loss.detach().cpu()) * sft_fraction
+                    # Combined backward for SFT + OPD in one pass
+                    if do_backward:
+                        student_backward_start = time.perf_counter()
+                        combined = (
+                            kl_loss * opd_fraction + sft_loss * sft_fraction
+                        ) * response_tokens / total_response_tokens
+                        combined.backward()
+                        student_backward_seconds += time.perf_counter() - student_backward_start
+                else:
+                    if do_backward:
+                        student_backward_start = time.perf_counter()
+                        (kl_loss * response_tokens / total_response_tokens).backward()
+                        student_backward_seconds += time.perf_counter() - student_backward_start
 
             loss_values.append(weighted_loss_value * response_tokens / total_response_tokens)
             offset += seq_len
@@ -719,9 +937,37 @@ def main() -> None:
                     batch_start = ((step - 1) * cfg.generation_batch_size) % len(train_examples)
                     batch = [train_examples[(batch_start + i) % len(train_examples)] for i in range(cfg.generation_batch_size)]
                     prompt_texts = [get_prompt_text(ex) for ex in batch]
-                    prompts = [build_prompt(tokenizer, prompt_text, chat_template_kwargs_for_model(cfg.student_model)) for prompt_text in prompt_texts]
                     messages_batch = [build_messages(prompt_text) for prompt_text in prompt_texts]
-                    debug_event("batch_ready", step=step, batch_start=batch_start, batch_size=len(batch), prompt_chars=sum(len(prompt) for prompt in prompts))
+
+                    # ── Hybrid SFT+OPD: extract gold prefixes ─────────────
+                    # When cfg.gold_prefix_field is set, each sample's prompt
+                    # is extended with its gold prefix so the rollout engine
+                    # generates only the continuation after it.
+                    is_hybrid_step = bool(cfg.gold_prefix_field)
+                    if is_hybrid_step:
+                        gold_prefixes_batch = [
+                            get_gold_prefix_text(ex, cfg.gold_prefix_field, cfg.gold_prefix_max_tokens, tokenizer)
+                            for ex in batch
+                        ]
+                        # Build prompts that embed the gold prefix; these are
+                        # passed to generate_from_prompts and to pack_sequences.
+                        prompts = [
+                            build_rollout_prompt_with_gold(
+                                tokenizer, pt, gp,
+                                chat_template_kwargs_for_model(cfg.student_model),
+                            )
+                            for pt, gp in zip(prompt_texts, gold_prefixes_batch)
+                        ]
+                        # Normalise: treat empty-gold samples as pure OPD
+                        gold_prefixes_batch = [gp or "" for gp in gold_prefixes_batch]
+                    else:
+                        gold_prefixes_batch = None
+                        prompts = [
+                            build_prompt(tokenizer, pt, chat_template_kwargs_for_model(cfg.student_model))
+                            for pt in prompt_texts
+                        ]
+
+                    debug_event("batch_ready", step=step, batch_start=batch_start, batch_size=len(batch), prompt_chars=sum(len(p) for p in prompts))
                     debug_event("rollout_generate_start", step=step, sample_count=len(messages_batch), max_concurrency=rollout_max_concurrency(len(messages_batch)))
                     rollout_start = time.perf_counter()
                     sync_cuda(device)
@@ -730,15 +976,27 @@ def main() -> None:
                         torch.cuda.empty_cache()
                         debug_event("mem_after_grad_buffer_release", step=step)
                     rollout_client.prepare()
-                    responses = rollout_client.generate_messages(
-                        messages_batch,
-                        max_tokens=cfg.max_total_tokens,
-                        temperature=cfg.temperature,
-                        top_p=cfg.top_p,
-                        top_k=cfg.generation_top_k,
-                        chat_template_kwargs=chat_template_kwargs_for_model(rollout_client.model),
-                        max_concurrency=rollout_max_concurrency(len(messages_batch)),
-                    )
+                    if is_hybrid_step:
+                        # Prompts already contain the gold prefix; skip the
+                        # redundant apply_chat_template inside generate_messages.
+                        responses = rollout_client.generate_from_prompts(
+                            prompts,
+                            max_tokens=cfg.max_total_tokens,
+                            temperature=cfg.temperature,
+                            top_p=cfg.top_p,
+                            top_k=cfg.generation_top_k,
+                            max_concurrency=rollout_max_concurrency(len(prompts)),
+                        )
+                    else:
+                        responses = rollout_client.generate_messages(
+                            messages_batch,
+                            max_tokens=cfg.max_total_tokens,
+                            temperature=cfg.temperature,
+                            top_p=cfg.top_p,
+                            top_k=cfg.generation_top_k,
+                            chat_template_kwargs=chat_template_kwargs_for_model(rollout_client.model),
+                            max_concurrency=rollout_max_concurrency(len(messages_batch)),
+                        )
                     sync_cuda(device)
                     if distributed and dist.is_initialized():
                         debug_event("rollout_barrier_start", step=step)
@@ -764,6 +1022,8 @@ def main() -> None:
                         slice_teacher_logits_to_student=slice_teacher_logits,
                         timing_stats=step_timing,
                         max_pack_tokens=cfg.max_pack_tokens,
+                        gold_prefixes=gold_prefixes_batch,
+                        sft_loss_weight=cfg.sft_loss_weight,
                     )
                     if cfg.offload_teacher:
                         teacher.to("cpu")

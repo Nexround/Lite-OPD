@@ -6,4 +6,5 @@ from .kl import (
     forward_kl_loss,
     jsd_loss,
     reverse_kl_loss,
+    sft_loss_from_hidden_chunk,
 )

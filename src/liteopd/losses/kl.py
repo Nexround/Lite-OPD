@@ -8,6 +8,37 @@ EPS = 1e-12
 SUPPORTED_LOSSES = {"forward_kl", "reverse_kl", "jsd"}
 
 
+# ---------------------------------------------------------------------------
+# SFT (cross-entropy) loss — used for the gold-prefix region in hybrid
+# SFT+OPD training.
+# ---------------------------------------------------------------------------
+
+def sft_loss_from_hidden_chunk(
+    student_chunk_hidden: torch.Tensor,
+    target_ids: torch.Tensor,
+    student_lm_head,
+) -> torch.Tensor:
+    """Cross-entropy loss for the gold-prefix region in hybrid SFT+OPD training.
+
+    Projects a chunk of student hidden states through the LM head, then
+    computes mean next-token cross-entropy against ``target_ids``.
+
+    Args:
+        student_chunk_hidden: ``(1, tokens, hidden_dim)`` float tensor.
+            Requires grad when called from the two-stage backward path.
+        target_ids: ``(tokens,)`` int64 tensor of ground-truth next-token IDs.
+            Corresponds to ``input_ids[sft_start+1 : sft_end+1]``.
+        student_lm_head: The student's language-model head (``nn.Linear`` or
+            equivalent ``ParallelLMHead``).
+
+    Returns:
+        Scalar mean cross-entropy loss over the chunk's token positions.
+    """
+    # (1, tokens, vocab) → (tokens, vocab) for cross_entropy
+    student_chunk_logits = student_lm_head(student_chunk_hidden).float().squeeze(0)
+    return F.cross_entropy(student_chunk_logits, target_ids.long())
+
+
 def _normalize_probs(probs: torch.Tensor) -> torch.Tensor:
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
 
