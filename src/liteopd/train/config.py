@@ -70,7 +70,7 @@ class TrainConfig:
     generation_use_vmm: bool = True
     offload_teacher: bool = False
     compile_teacher: bool = True
-    attn_implementation: str = "flash_attention_2"
+    attn_implementation: str = "sdpa"
     distributed_strategy: str = "zero2"
     max_pack_tokens: int = 32768
     max_prompt_length: int = 1024
