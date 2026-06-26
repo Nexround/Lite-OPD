@@ -362,8 +362,14 @@ class GatedDeltaNetAttn(BaseOP):
                 seg   = qkv_raw[offset : offset + T]   # [T, conv_ch]
 
                 if _CAUSAL_CONV1D_AVAILABLE and _cc1d_fn is not None:
-                    # initial_states shape: [1, conv_ch, ks-1]
-                    s0 = pool.conv_buffer[li, req.table_idx].unsqueeze(0)  # [1, conv_ch, ks-1]
+                    # causal_conv1d >= new API requires initial_states.stride(1) == 1
+                    # (channels must be contiguous in memory).  The pool buffer is
+                    # [n_layers, n_slots, conv_ch, ks-1] so a [li, idx] slice has
+                    # strides (ks-1, 1) → stride(1) == ks-1 after unsqueeze.
+                    # Transpose to make channels innermost, copy to get contiguous
+                    # memory, then transpose back: strides become (1, conv_ch).
+                    s0_2d = pool.conv_buffer[li, req.table_idx]           # [conv_ch, ks-1]
+                    s0 = s0_2d.T.contiguous().T.unsqueeze(0)              # [1, conv_ch, ks-1], stride(1)==1
                     sf = torch.empty_like(s0)
                     out_t = _cc1d_fn(
                         x=seg.T.unsqueeze(0),       # [1, conv_ch, T]
