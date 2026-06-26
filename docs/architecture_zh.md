@@ -89,6 +89,52 @@ HF 原始格式:                    Fused 格式（训练 + 推理共用）:
 
 这消除了每步训练后的权重同步开销，也消除了模型权重的双份显存占用。
 
+## 训练后端：transformers
+
+训练侧的 forward/backward 完全基于 **HuggingFace transformers**。`fused_model.py` 做的只是外科手术式优化（合并 QKV/GateUp 为一次 matmul），attention 计算本身仍走 transformers 的标准 dispatch：
+
+```python
+# fused_model.py（每种架构的 attention forward 都是这个模式）
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+attn_output, _ = attention_interface(self, query_states, key_states, value_states, ...)
+```
+
+`attn_implementation` 配置项（默认 `"sdpa"`）控制具体使用哪个 transformers attention 函数：
+
+| 值 | 底层实现 | 外部依赖 |
+|---|---|---|
+| `"sdpa"` | `torch.nn.functional.scaled_dot_product_attention` | 无（PyTorch 内置） |
+| `"flash_attention_2"` | Tri Dao `flash-attn` 包 | 需安装 `flash-attn` |
+| `"eager"` | 纯 Python，调试用 | 无 |
+| `"flex_attention"` | `torch.nn.attention.flex_attention` | 无，但 Qwen3.5 未适配 |
+
+## 训练 attention 与推理 attention 的分离
+
+这是框架最容易混淆的设计点。**两套 attention 系统完全独立，服务于不同阶段**：
+
+```
+OPD 训练循环
+│
+├── 【推理阶段】student 采样 token
+│     └── inference/attention/（fa.py / fi.py / trtllm.py）
+│           由 cfg.generation_attention_backend 控制
+│           支持 KV cache、paged attention、CUDA graph、cu_seqlens
+│           fa 后端需要 flash_attn 包（varlen 接口）
+│
+└── 【训练阶段】student / teacher forward + backward
+      └── transformers ALL_ATTENTION_FUNCTIONS[cfg.attn_implementation]
+            由 cfg.attn_implementation 控制
+            标准 causal attention，无 KV cache
+            "sdpa" 不需要任何额外包
+```
+
+两个配置项互不影响：
+- `attn_implementation`（TrainConfig）→ 只影响训练 forward
+- `generation_attention_backend`（TrainConfig）→ 只影响推理采样
+
+`inference/attention/` 中 `flash_attn` 包的必要性来自推理侧对变长序列接口（`flash_attn_varlen_func`、`cu_seqlens`）的依赖，与训练侧无关。训练侧使用 `"sdpa"` 即可获得 PyTorch 内置的高效 attention，无需安装额外包。
+
 ## 推理引擎架构
 
 推理引擎是 Lite-OPD 的核心组件，负责高效生成 student rollout。它是一个嵌入式引擎（与训练共享 GPU 和权重），而非独立服务。

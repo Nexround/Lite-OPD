@@ -93,6 +93,52 @@ HF original format:                Fused format (shared by training + inference)
 
 This eliminates per-step weight synchronization overhead and the duplicate memory usage of model weights.
 
+## Training Backend: transformers
+
+The training forward/backward is entirely based on **HuggingFace transformers**. `fused_model.py` only performs surgical optimizations (merging QKV/GateUp into a single matmul); the attention computation itself still goes through transformers' standard dispatch:
+
+```python
+# fused_model.py (every architecture's attention forward follows this pattern)
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+attn_output, _ = attention_interface(self, query_states, key_states, value_states, ...)
+```
+
+The `attn_implementation` config option (default `"sdpa"`) selects which transformers attention function to use:
+
+| Value | Underlying implementation | External dependency |
+|---|---|---|
+| `"sdpa"` | `torch.nn.functional.scaled_dot_product_attention` | None (PyTorch built-in) |
+| `"flash_attention_2"` | Tri Dao `flash-attn` package | Requires `flash-attn` |
+| `"eager"` | Pure Python, for debugging | None |
+| `"flex_attention"` | `torch.nn.attention.flex_attention` | None, but Qwen3.5 is not supported |
+
+## Training Attention vs. Inference Attention
+
+This is the most commonly confused design point. **The two attention systems are completely independent, serving different phases:**
+
+```
+OPD Training Loop
+│
+├── [Inference phase] student samples tokens
+│     └── inference/attention/ (fa.py / fi.py / trtllm.py)
+│           Controlled by cfg.generation_attention_backend
+│           Supports KV cache, paged attention, CUDA graph, cu_seqlens
+│           fa backend requires flash_attn package (varlen interface)
+│
+└── [Training phase] student / teacher forward + backward
+      └── transformers ALL_ATTENTION_FUNCTIONS[cfg.attn_implementation]
+            Controlled by cfg.attn_implementation
+            Standard causal attention, no KV cache
+            "sdpa" requires no additional packages
+```
+
+The two config options are independent:
+- `attn_implementation` (TrainConfig) → only affects training forward
+- `generation_attention_backend` (TrainConfig) → only affects inference sampling
+
+The `flash_attn` package dependency in `inference/attention/` comes from the inference side's need for variable-length sequence interfaces (`flash_attn_varlen_func`, `cu_seqlens`), unrelated to the training side. The training side uses `"sdpa"` to get PyTorch's built-in efficient attention without installing any extra packages.
+
 ## Inference Engine Architecture
 
 The inference engine is Lite-OPD's core component, responsible for efficiently generating student rollouts. It is an embedded engine (sharing GPU and weights with training), not a standalone service.
