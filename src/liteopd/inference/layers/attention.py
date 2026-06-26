@@ -39,7 +39,10 @@ class AttentionLayer(StateLessOP):
             rotary_dim=rotary_config.rotary_dim,
             max_position=rotary_config.max_position,
             base=rotary_config.base,
-            rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+            rope_scaling=tuple(
+                (k, tuple(v) if isinstance(v, list) else v)
+                for k, v in rotary_config.scaling.items()
+            ) if rotary_config.scaling else None,
         )
         self.q_norm = q_norm
         self.k_norm = k_norm
