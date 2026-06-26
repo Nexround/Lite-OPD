@@ -70,6 +70,7 @@ class TrainConfig:
     generation_use_vmm: bool = True
     offload_teacher: bool = False
     compile_teacher: bool = True
+    attn_implementation: str = "flash_attention_2"
     distributed_strategy: str = "zero2"
     max_pack_tokens: int = 32768
     max_prompt_length: int = 1024
@@ -133,6 +134,10 @@ def load_train_config(path: str | Path) -> TrainConfig:
         raise ValueError("eval_every_steps must be positive")
     if cfg.kl_backward_mode not in {"sample", "chunk", "two_stage"}:
         raise ValueError("kl_backward_mode must be one of {'sample', 'chunk', 'two_stage'}")
+    if cfg.attn_implementation not in {"eager", "sdpa", "flash_attention_2", "flex_attention"}:
+        raise ValueError(
+            f"attn_implementation must be one of {{'eager', 'sdpa', 'flash_attention_2', 'flex_attention'}}, got '{cfg.attn_implementation}'"
+        )
     if cfg.distributed_strategy not in {"ddp", "zero2"}:
         raise ValueError("distributed_strategy must be one of {'ddp', 'zero2'}")
     if cfg.distributed_strategy == "ddp" and cfg.kl_backward_mode == "chunk":

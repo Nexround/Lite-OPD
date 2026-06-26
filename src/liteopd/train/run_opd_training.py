@@ -820,7 +820,7 @@ def main() -> None:
             student = AutoModelForCausalLM.from_pretrained(
                 cfg.student_model,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flex_attention",
+                attn_implementation=cfg.attn_implementation,
                 trust_remote_code=True,
             ).to(device)
             from liteopd.train.fused_model import fuse_model_projections
@@ -864,7 +864,7 @@ def main() -> None:
             teacher = AutoModelForCausalLM.from_pretrained(
                 cfg.teacher_model,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flex_attention",
+                attn_implementation=cfg.attn_implementation,
                 trust_remote_code=True,
             )
             if not cfg.offload_teacher:
