@@ -460,7 +460,7 @@ class GatedDeltaNetAttn(BaseOP):
             S0 = pool.delta_state[req.table_idx, li].clone().float()  # [nv, dk, dv]
 
             if _FLA_AVAILABLE and _fla_chunk is not None:
-                # ---- FLA path: [1, T, H, D] format (head_first=False) ----
+                # ---- FLA path: [1, T, H, D] format ([B, T, H, D] required) ----
                 # Expand key/query to value-head count (GQA broadcast)
                 q_fla  = q_seq[:, kh_idx, :].unsqueeze(0)    # [1, T, local_nv, dk]
                 k_fla  = k_seq[:, kh_idx, :].unsqueeze(0)    # [1, T, local_nv, dk]
@@ -479,7 +479,6 @@ class GatedDeltaNetAttn(BaseOP):
                         g=g_fla.to(torch.float32),
                         initial_state=s0_fla,
                         output_final_state=True,
-                        head_first=False,   # [B, T, H, D]
                     )
                     pool.delta_state[req.table_idx, li].copy_(
                         sf_fla.squeeze(0).to(pool.delta_state.dtype)
@@ -535,7 +534,7 @@ class GatedDeltaNetAttn(BaseOP):
 
         When flash-linear-attention is available, delegates to
         ``chunk_gated_delta_rule`` with T=1 (same kernel as prefill, GQA-
-        broadcast inputs in [B, 1, H, D] head_first=False layout).  The
+        broadcast inputs in [B, 1, H, D] layout (FLA requires [B, T, H, D]).  The
         updated state is copied back to pool.working_state in-place.
 
         Falls back to a vectorised PyTorch einsum when FLA is not installed.
@@ -551,7 +550,7 @@ class GatedDeltaNetAttn(BaseOP):
 
         if _FLA_AVAILABLE and _fla_chunk is not None:
             # ---- FLA path: chunk_gated_delta_rule with T=1 ---------------
-            # Reshape inputs to [B, T=1, H, D] (head_first=False).
+            # Reshape inputs to [B, T=1, H, D] ([B, T, H, D] required by FLA).
             # GQA-broadcast q/k/b/g from key-head count to value-head count.
             q_fla = q[:, kh_idx, :].unsqueeze(1).float()   # [B, 1, local_nv, dk]
             k_fla = k[:, kh_idx, :].unsqueeze(1).float()   # [B, 1, local_nv, dk]
@@ -567,7 +566,6 @@ class GatedDeltaNetAttn(BaseOP):
                 g=g_fla,
                 initial_state=s0,
                 output_final_state=True,
-                head_first=False,
             )
             # Write updated state back to fixed-address working buffer.
             pool.working_state[:B, li].copy_(sf_fla.to(pool.working_state.dtype))
