@@ -13,6 +13,43 @@ SUPPORTED_LOSSES = {"forward_kl", "reverse_kl", "jsd"}
 # SFT+OPD training.
 # ---------------------------------------------------------------------------
 
+def chunked_entropy_from_hidden(
+    student_hidden: torch.Tensor,
+    student_lm_head,
+    chunk_tokens: int = 32,
+) -> torch.Tensor:
+    """Mean token entropy (nats) of the student's output distribution.
+
+    H(p) = -∑_v p(v) log p(v), averaged over all token positions in
+    *student_hidden*.  Chunked projection keeps peak memory bounded.
+
+    Call inside ``torch.no_grad()`` — this function does not set up any
+    autograd graph.
+
+    Args:
+        student_hidden: ``(1, tokens, hidden_dim)`` float tensor.
+        student_lm_head: The student's LM head (``nn.Linear`` or equivalent).
+        chunk_tokens: Number of token positions projected per iteration.
+
+    Returns:
+        Scalar mean entropy in nats (natural logarithm).
+    """
+    seq_len = student_hidden.shape[1]
+    total_entropy = student_hidden.new_zeros(())
+    total_tokens = 0
+
+    for start in range(0, seq_len, chunk_tokens):
+        end = min(seq_len, start + chunk_tokens)
+        logits = student_lm_head(student_hidden[:, start:end, :]).float()  # (1, t, vocab)
+        probs  = F.softmax(logits, dim=-1)
+        # -∑_v p log p per token position; clamp for numerical stability
+        ent = -(probs * probs.clamp_min(EPS).log()).sum(dim=-1)             # (1, t)
+        total_entropy = total_entropy + ent.sum()
+        total_tokens  += logits.shape[0] * logits.shape[1]
+
+    return total_entropy / total_tokens if total_tokens > 0 else total_entropy
+
+
 def sft_loss_from_hidden_chunk(
     student_chunk_hidden: torch.Tensor,
     target_ids: torch.Tensor,

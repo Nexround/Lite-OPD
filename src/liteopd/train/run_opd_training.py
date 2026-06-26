@@ -26,7 +26,7 @@ from liteopd.eval.scoring import (
     compute_named_accuracies_with_rollout_client_batched as _compute_named_accuracies_batched,
     distributed_eval as _distributed_eval,
 )
-from liteopd.losses import chunk_loss_from_hidden_chunk, chunked_kl_from_hidden, chunked_kl_from_logits, distillation_loss, sft_loss_from_hidden_chunk
+from liteopd.losses import chunk_loss_from_hidden_chunk, chunked_entropy_from_hidden, chunked_kl_from_hidden, chunked_kl_from_logits, distillation_loss, sft_loss_from_hidden_chunk
 from liteopd.train.config import load_train_config
 from liteopd.train.logging import JsonlLogger
 from liteopd.train.packing import pack_sequences
@@ -295,6 +295,9 @@ def batch_rollout_and_loss_with_client(
     # Hybrid SFT+OPD parameters
     gold_prefixes: List[str] | None = None,
     sft_loss_weight: float = 1.0,
+    # Output dict for auxiliary metrics (e.g. student_entropy).
+    # Keys are written only when this argument is not None.
+    metrics_out: dict | None = None,
 ) -> torch.Tensor:
     """Rollout, pack, forward, and backward for one training step.
 
@@ -351,6 +354,9 @@ def batch_rollout_and_loss_with_client(
     model_for_forward = student.module if hasattr(student, "module") else student
     lm_head_params = [param for param in model_for_forward.lm_head.parameters() if param.requires_grad]
     loss_values = []
+    # Entropy tracking: list of (mean_entropy_nats, opd_token_count) per sample.
+    # Used to compute a token-count-weighted mean entropy across the full step.
+    entropy_values: list[tuple[float, int]] = [] if metrics_out is not None else []
     if profile_memory and logger is not None and step is not None:
         logger.log({"phase": "memory_profile", "time": time.time(), "step": step, "stage": "after_rollout_generation", **capture_memory_stats(device)})
 
@@ -559,6 +565,24 @@ def batch_rollout_and_loss_with_client(
                         student_backward_seconds += time.perf_counter() - student_backward_start
 
             loss_values.append(weighted_loss_value * response_tokens / total_response_tokens)
+
+            # ── Student output entropy (OPD region) ───────────────────────
+            # Computed from the same student hidden states used for the KL
+            # loss, but inside torch.no_grad() so it does not affect the
+            # backward graph or memory budget.
+            # Entropy of the SFT (gold-prefix) region is intentionally
+            # excluded: the student is given the gold text, so its
+            # distribution there is less informative than on its own rollout.
+            if metrics_out is not None:
+                with torch.no_grad():
+                    opd_hidden = student_hidden_packed[0, response_start:response_end, :].unsqueeze(0)
+                    sample_entropy = chunked_entropy_from_hidden(
+                        opd_hidden,
+                        model_for_forward.lm_head,
+                        chunk_tokens=max(1, opd_tokens // 8),
+                    )
+                    entropy_values.append((float(sample_entropy.cpu()), opd_tokens))
+
             offset += seq_len
 
         if do_backward and kl_backward_mode == "two_stage":
@@ -589,6 +613,15 @@ def batch_rollout_and_loss_with_client(
         )
     if not loss_values:
         raise ValueError("no sample losses were produced in batch_rollout_and_loss_with_client")
+
+    if metrics_out is not None and entropy_values:
+        # Token-count-weighted mean entropy across all OPD positions in the step.
+        total_opd_tokens = sum(t for _, t in entropy_values)
+        metrics_out["student_entropy"] = (
+            sum(e * t for e, t in entropy_values) / total_opd_tokens
+            if total_opd_tokens > 0 else 0.0
+        )
+
     return torch.tensor(sum(loss_values) / len(loss_values), device=device)
 
 
@@ -1008,6 +1041,7 @@ def main() -> None:
                     if cfg.profile_memory:
                         logger.log({"phase": "memory_profile", "time": time.time(), "step": step, "stage": "after_rollout_generation", **capture_memory_stats(device)})
                     micro_losses = []
+                    step_metrics: dict = {}
                     # packing mode: pass all prompts/responses at once; pack_sequences handles grouping
                     if cfg.offload_teacher:
                         teacher.to(device)
@@ -1024,6 +1058,7 @@ def main() -> None:
                         max_pack_tokens=cfg.max_pack_tokens,
                         gold_prefixes=gold_prefixes_batch,
                         sft_loss_weight=cfg.sft_loss_weight,
+                        metrics_out=step_metrics,
                     )
                     if cfg.offload_teacher:
                         teacher.to("cpu")
@@ -1078,7 +1113,7 @@ def main() -> None:
 
                 recent_loss_values.append(loss_value)
                 if step % cfg.log_every == 0:
-                    log_if_rank0(logger, rank, {
+                    train_log_record = {
                         "phase": "train",
                         "time": time.time(),
                         "step": step,
@@ -1094,7 +1129,11 @@ def main() -> None:
                         "student_backward_seconds": step_timing.get("student_backward_seconds", 0.0),
                         "other_seconds": residual_seconds,
                         "avg_gen_tokens": sum(getattr(rollout_client, 'last_output_token_counts', None) or [len(tokenizer.encode(r, add_special_tokens=False)) for r in responses]) / max(len(responses), 1),
-                    })
+                    }
+                    # Auxiliary metrics collected inside batch_rollout_and_loss_with_client
+                    if "student_entropy" in step_metrics:
+                        train_log_record["student_entropy"] = step_metrics["student_entropy"]
+                    log_if_rank0(logger, rank, train_log_record)
                 debug_event("step_end", step=step, examples_per_minute=examples_per_minute)
 
                 if step % cfg.save_every_steps == 0:

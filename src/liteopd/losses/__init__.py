@@ -1,5 +1,6 @@
 from .kl import (
     chunk_loss_from_hidden_chunk,
+    chunked_entropy_from_hidden,
     chunked_kl_from_hidden,
     chunked_kl_from_logits,
     distillation_loss,
