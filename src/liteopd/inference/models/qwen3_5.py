@@ -371,14 +371,14 @@ class GatedDeltaNetAttn(BaseOP):
                     s0_2d = pool.conv_buffer[li, req.table_idx]           # [conv_ch, ks-1]
                     s0 = s0_2d.T.contiguous().T.unsqueeze(0)              # [1, conv_ch, ks-1], stride(1)==1
                     sf = torch.empty_like(s0)
-                    out_t = _cc1d_fn(
+                    out_t, _ = _cc1d_fn(
                         x=seg.T.unsqueeze(0),       # [1, conv_ch, T]
                         weight=w_2d,
                         bias=bias,
                         initial_states=s0,
                         return_final_states=True,
                         final_states_out=sf,
-                    )  # out_t: [1, conv_ch, T]
+                    )  # returns (out [1, conv_ch, T], final_states); sf updated in-place
                     pool.conv_buffer[li, req.table_idx].copy_(sf.squeeze(0))
                 else:
                     # F.conv1d fallback: left-pad with history buffer
