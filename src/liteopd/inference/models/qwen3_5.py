@@ -18,8 +18,8 @@ GatedDeltaNet (the other 3/4 of layers)
     S[h] ← decay_h * S[h] + outer(v_t[h] - S[h]@k_t[kh], b_t[kh] * k_t[kh])
     o_t[h] = S[h] @ q_t[kh]
   Decode state accesses go through the working buffer (pre-gathered before,
-  scattered back after, by Engine.forward_batch).  Graph capture is disabled
-  until the FLA kernel backend is integrated — see "CUDA-graph capture" note.
+  scattered back after, by Engine.forward_batch).  Both the FLA chunk-T=1
+  path and the PyTorch fallback are CUDA-graph-safe — see "CUDA-graph capture".
 
 Tensor parallelism
   Full-attention  → same as Qwen3 (already TP-aware via RopeAttn / LinearQKV)
@@ -30,13 +30,23 @@ Flash-linear-attention (optional)
   If ``flash-linear-attention`` is installed, prefill uses ``chunk_gated_delta_rule``
   for O(T / chunk) speedup.  Falls back to a PyTorch loop otherwise.
 
-CUDA-graph capture — currently DISABLED for Qwen3.5
-  GatedDeltaNet decode steps cannot be captured into a CUDA graph until the
-  flash-linear-attention kernel backend is fully integrated (the FLA decode
-  kernel exposes a fixed-address state API that the graph runner requires).
-  Set ``cuda_graph_max_bs: 0`` in any Qwen3.5 config to run all forward passes
-  eagerly.  Re-enable once DeltaNet graph-capture support is added.
-  See: configs/qwen3_5_*.yaml → generation_cuda_graph_max_bs: 0
+CUDA-graph capture — ENABLED for Qwen3.5
+  Decode steps are CUDA-graph-safe under both execution paths:
+
+  • FLA path (``flash-linear-attention`` installed):
+      _decode_deltanet calls ``chunk_gated_delta_rule`` with T=1.  All input
+      and output tensor shapes are fixed for a given padded batch size, so the
+      Triton kernel is captured cleanly.  The final state is copied back to
+      pool.working_state (fixed-address buffer) via an in-place ``.copy_()``.
+
+  • PyTorch einsum fallback (FLA not installed):
+      All intermediate tensors are fixed-size for a given padded batch size;
+      pool.working_state is a pre-allocated fixed-address buffer.  The cached
+      self._kh_idx avoids any dynamic allocation inside the captured region.
+
+  Leave ``generation_cuda_graph_max_bs`` unset (or None) in Qwen3.5 configs
+  to enable auto-detection (256 on H200, 160 otherwise).  Set to 0 only to
+  force eager mode for debugging.
 
 Weight-name compatibility with HuggingFace Qwen3.5
   Full-attention layers   → model.layers.{i}.self_attn.*
@@ -202,8 +212,9 @@ class GatedDeltaNetAttn(BaseOP):
       out_proj     row-parallel  [nv*dv → hidden]           + all-reduce
 
     Decode uses working buffers (pre-gathered by Engine.forward_batch) instead
-    of dynamic pool indexing.  CUDA-graph capture is not yet enabled — the FLA
-    kernel backend must be integrated first (see module docstring).
+    of dynamic pool indexing.  Decode steps are CUDA-graph-safe (see module
+    docstring); both the FLA chunk-T=1 path and the PyTorch einsum fallback
+    operate exclusively on fixed-address, fixed-shape tensors.
 
     Prefill uses the flash-linear-attention chunk kernel when available,
     falling back to a PyTorch token loop otherwise.
@@ -252,9 +263,8 @@ class GatedDeltaNetAttn(BaseOP):
         self._local_qkv_out   = local_conv_ch
         # Maps each value head to its corresponding key head (GQA broadcast).
         # Lazily initialised on first forward call so we have the right device.
-        # Cached as a fixed tensor to avoid torch.arange allocation on every
-        # decode step — a prerequisite for CUDA-graph capture once FLA support
-        # lands (see module docstring).
+        # Cached as a fixed tensor to avoid a torch.arange allocation on every
+        # decode step, which would prevent CUDA-graph capture.
         self._kh_idx: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
@@ -327,7 +337,7 @@ class GatedDeltaNetAttn(BaseOP):
           • conv_state = pool.conv_buffer[li]  [n_slots, conv_ch, ks-1]
           • conv_state_indices = pool.table_indices_buf[:B]  (pre-filled in gather)
           • The kernel reads/writes the correct pool slots directly — zero extra
-            gather/scatter for conv state (graph-capture-ready once FLA lands)
+            gather/scatter for conv state (CUDA-graph-safe)
         """
         li      = self._local_delta_idx
         ks      = self._ks
@@ -519,44 +529,70 @@ class GatedDeltaNetAttn(BaseOP):
         Uses pool.working_state (pre-gathered by Engine.forward_batch).
         Fully vectorised — no Python loops.
 
-        CUDA-graph status: NOT YET SAFE.
-          The graph-capture path requires the flash-linear-attention kernel
-          backend to expose a fixed-address decode API.  Until that lands,
-          all Qwen3.5 configs must set ``cuda_graph_max_bs: 0``.  See the
-          module docstring for details.
-        """
-        li        = self._local_delta_idx
-        local_nv  = self._local_nv
+        CUDA-graph status: SAFE.
+          Both execution paths operate on fixed-address, fixed-shape tensors
+          for a given padded batch size.  See module docstring for details.
 
-        B = q.shape[0]   # padded batch size
-        # Use the cached (fixed-address) head-index tensor — avoids a
-        # torch.arange allocation on every decode step, which would prevent
-        # graph capture even after the FLA backend is integrated.
+        When flash-linear-attention is available, delegates to
+        ``chunk_gated_delta_rule`` with T=1 (same kernel as prefill, GQA-
+        broadcast inputs in [B, 1, H, D] head_first=False layout).  The
+        updated state is copied back to pool.working_state in-place.
+
+        Falls back to a vectorised PyTorch einsum when FLA is not installed.
+        """
+        li       = self._local_delta_idx
+        local_nv = self._local_nv
+
+        B = q.shape[0]   # padded batch size (fixed per CUDA graph)
+        # Use cached head-index tensor: avoids torch.arange inside the graph.
         if self._kh_idx is None:
             self._kh_idx = torch.arange(local_nv, device=q.device) // self._kv_groups
         kh_idx = self._kh_idx  # [local_nv]
 
-        # --- load state from working buffer (fixed address) ---------------
-        S = pool.working_state[:B, li].float()  # [B, local_nv, dk, dv]
+        if _FLA_AVAILABLE and _fla_chunk is not None:
+            # ---- FLA path: chunk_gated_delta_rule with T=1 ---------------
+            # Reshape inputs to [B, T=1, H, D] (head_first=False).
+            # GQA-broadcast q/k/b/g from key-head count to value-head count.
+            q_fla = q[:, kh_idx, :].unsqueeze(1).float()   # [B, 1, local_nv, dk]
+            k_fla = k[:, kh_idx, :].unsqueeze(1).float()   # [B, 1, local_nv, dk]
+            v_fla = v.unsqueeze(1).float()                  # [B, 1, local_nv, dv]
+            b_fla = b[:, kh_idx, :].unsqueeze(1).float()   # [B, 1, local_nv, dk]
+            g_fla = g[:, kh_idx].unsqueeze(1).float()       # [B, 1, local_nv]
+            # Read state from fixed-address working buffer.
+            s0    = pool.working_state[:B, li].float()      # [B, local_nv, dk, dv]
 
-        # --- GQA broadcast k/q/b/g to value-head count --------------------
+            o_fla, sf_fla = _fla_chunk(
+                q_fla, k_fla, v_fla,
+                beta=b_fla,
+                g=g_fla,
+                initial_state=s0,
+                output_final_state=True,
+                head_first=False,
+            )
+            # Write updated state back to fixed-address working buffer.
+            pool.working_state[:B, li].copy_(sf_fla.to(pool.working_state.dtype))
+            return o_fla.squeeze(1).to(q.dtype)   # [B, local_nv, dv]
+
+        # ---- PyTorch einsum fallback -------------------------------------
+        # Load state from working buffer (fixed address).
+        S   = pool.working_state[:B, li].float()  # [B, local_nv, dk, dv]
+        # GQA broadcast: map from key-head indexing to value-head indexing.
         k_h = k[:, kh_idx, :].float()   # [B, local_nv, dk]
         q_h = q[:, kh_idx, :].float()   # [B, local_nv, dk]
         b_h = b[:, kh_idx, :].float()   # [B, local_nv, dk]
         g_h = g[:, kh_idx].float()      # [B, local_nv]
-        v_f = v.float()                 # [B, local_nv, dv]
+        v_f = v.float()                  # [B, local_nv, dv]
 
-        # --- vectorised state update --------------------------------------
-        decay = torch.exp(g_h)          # [B, local_nv]
+        decay = torch.exp(g_h)                                        # [B, local_nv]
         S     = S * decay[:, :, None, None]
         Sk    = torch.einsum("bhk,bhkv->bhv", k_h, S)
         delta = v_f - Sk
         S     = S + torch.einsum("bhv,bhk->bhkv", delta, b_h * k_h)
         o     = torch.einsum("bhk,bhkv->bhv", q_h, S)
 
-        # --- write back to working buffer (scatter happens after fwd) ------
+        # Write updated state back to working buffer (scatter to pool happens
+        # after the full forward pass in Engine.forward_batch).
         pool.working_state[:B, li].copy_(S.to(pool.working_state.dtype))
-
         return o.to(q.dtype)   # [B, local_nv, dv]
 
 
