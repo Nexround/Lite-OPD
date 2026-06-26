@@ -26,3 +26,5 @@
 训练数据需包含 `problem` 和 `solution` 字段（或 `messages` 字段）。支持 parquet 和 jsonl 格式。
 
 评测数据需包含 `problem` 和 `solution` 字段（jsonl 格式）。评测时模型对 `problem` 生成回答，通过数学验证器与 `solution` 中的答案比对判定正确性。
+
+完整的字段规范、支持的文件格式、混合 SFT+OPD 要求及多来源数据混合，请参阅 **[docs/dataset_format_zh.md](../docs/dataset_format_zh.md)**。

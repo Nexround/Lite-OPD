@@ -128,6 +128,8 @@ CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 bash scripts/train.sh configs/example_qw
 ## Documentation
 
 - [Configuration Reference](configs/README.md)
+- [Dataset Format and Requirements](docs/dataset_format.md)
+- [Hybrid SFT + OPD Training](docs/hybrid_sft_opd.md)
 - [Acceleration Techniques](docs/acceleration_techniques.md)
 - [Code Architecture](docs/architecture.md)
 

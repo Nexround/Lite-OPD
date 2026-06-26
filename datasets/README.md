@@ -26,3 +26,5 @@ This directory contains sample data subsets for quick validation.
 Training data must contain `problem` and `solution` fields (or a `messages` field). Both parquet and jsonl formats are supported.
 
 Evaluation data must contain `problem` and `solution` fields (jsonl format). During evaluation, the model generates a response to `problem`, and correctness is determined by comparing against the answer in `solution` using a math verifier.
+
+For complete field specifications, supported file formats, hybrid SFT+OPD requirements, and multi-source mixing, see **[docs/dataset_format.md](../docs/dataset_format.md)**.

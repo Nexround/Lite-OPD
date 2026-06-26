@@ -127,6 +127,8 @@ CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 bash scripts/train.sh configs/experiment
 ## 文档
 
 - [配置参考](configs/README_zh.md)
+- [数据集格式与要求](docs/dataset_format_zh.md)
+- [混合 SFT + OPD 训练](docs/hybrid_sft_opd_zh.md)
 - [加速技术](docs/acceleration_techniques_zh.md)
 - [代码架构](docs/architecture_zh.md)
 
